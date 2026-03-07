@@ -1,0 +1,14 @@
+build/
+build-*/
+.vscode/settings.json
+.vscode/extensions.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+sdkconfig.old
+*.bin
+*.elf
+*.map
+*.log
+.DS_Store
