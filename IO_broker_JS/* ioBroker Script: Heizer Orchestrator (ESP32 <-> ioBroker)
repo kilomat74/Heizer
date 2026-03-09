@@ -1,42 +1,51 @@
 /************************************************************
  * ioBroker Script: Heizer Orchestrator (ESP32 <-> ioBroker)
- * Rolle:
- * - Nimmt ESP32-Heizanforderung (MQTT request) entgegen
- * - Entscheidet finalen Schaltzustand (AUTO / MANUAL_ON / MANUAL_OFF)
- * - Schaltet Zigbee-Steckdose
- * - Sendet echten Status + reason + power + session-Werte per MQTT status zurück
+ *
+ * Zielarchitektur:
+ * - ESP32: UI + Sensor + Display + MQTT I/O
+ * - ioBroker: finale Schaltentscheidung
+ *
+ * Modi:
+ * - AUTO: ioBroker entscheidet mit temp/target/window
+ * - MANUAL_ON: dauerhaft EIN
+ * - MANUAL_OFF: dauerhaft AUS
  ************************************************************/
 
 /* ========= KONFIG ========= */
 const CFG = {
-    // MQTT-Objekte im ioBroker MQTT-Adapter
+    // MQTT-Objekte (aus mqtt.0)
     mqttRequestId: 'mqtt.0.heizer.room.request',
     mqttConfigId:  'mqtt.0.heizer.room.config',
+    mqttStateIn:   'mqtt.0.heizer.room.state',
     mqttStatusOut: 'mqtt.0.heizer.room.status',
 
-    // Optional: ESP state stream (falls du Werte lieber von dort liest)
-    mqttStateIn:   'mqtt.0.heizer.room.state',
-
-    // Zigbee-Steckdose
+    // Zigbee Zwischenstecker
     zigbeeSwitchId: 'zigbee.0.0c4314fffe52af5b.state',
     zigbeePowerId:  'zigbee.0.0c4314fffe52af5b.load_power',
 
-    // Quelle für Temperatur/Feuchte (priorisiert MQTT state, fallback ioBroker-Sensor)
-    tempIdFallback: '', // z.B. 'zigbee.0.xyz.temperature'
-    humIdFallback:  '', // z.B. 'zigbee.0.xyz.humidity'
+    // Optionaler Fallback-Sensor (wenn kein ESP state kommt)
+    tempIdFallback: '',
+    humIdFallback: '',
 
-    // Session-Zähler in ioBroker
-    dpBase: 'javascript.0.heizer.session', // wird automatisch angelegt
+    // Session-Zähler
+    dpBase: 'javascript.0.heizer.session',
 
     // Zyklus
     evalIntervalSec: 5,
+    confirmDelayMs: 1200,
 
-    // Sicherheiten
-    maxPowerW: 10000,
+    // Grenzen
+    maxPowerW: 12000,
     staleMs: 90 * 1000
 };
 
 /* ========= HILFEN ========= */
+function nowMs() { return Date.now(); }
+function parseJsonSafe(str) { try { return JSON.parse(str); } catch (e) { return null; } }
+function toNum(v, def) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : def;
+}
 function toBool(v) {
     if (typeof v === 'boolean') return v;
     if (typeof v === 'number') return v !== 0;
@@ -47,185 +56,270 @@ function toBool(v) {
     }
     return null;
 }
-function nowMs() { return Date.now(); }
-
+function normalizeMode(m) {
+    if (!m) return 'AUTO';
+    const x = String(m).toUpperCase();
+    if (x === 'ON') return 'MANUAL_ON';
+    if (x === 'OFF') return 'MANUAL_OFF';
+    if (x === 'MANUAL_ON' || x === 'MANUAL_OFF' || x === 'AUTO') return x;
+    return 'AUTO';
+}
 function ensureState(id, common) {
-    if (!existsObject(id)) {
-        createState(id, common.def, { ...common, read: true, write: true });
-    }
+    if (!existsObject(id)) createState(id, common.def, { ...common, read: true, write: true });
 }
 function g(id, def = null) {
     const st = getState(id);
     return st ? st.val : def;
 }
-function set(id, val, ack = true) {
-    setState(id, val, ack);
-}
-function parseJsonSafe(str) {
-    try { return JSON.parse(str); } catch (e) { return null; }
+function setAck(id, val) { setState(id, val, true); }
+function safeSetForeign(id, val, ack = false) {
+    try {
+        if (!existsState(id)) {
+            log(`[Heizer Orchestrator] State fehlt: ${id}`, 'warn');
+            return false;
+        }
+        setState(id, val, ack);
+        return true;
+    } catch (e) {
+        log(`[Heizer Orchestrator] setState Fehler auf ${id}: ${e}`, 'warn');
+        return false;
+    }
 }
 
-/* ========= STATES ========= */
+/* ========= INTERNE STATES ========= */
 const DP = {
-    sessionKwh: `${CFG.dpBase}.kwh`,
-    sessionCost: `${CFG.dpBase}.cost_eur`,
-    sessionStartTs: `${CFG.dpBase}.start_ts`,
-    mode: `${CFG.dpBase}.mode`,                 // AUTO|MANUAL_ON|MANUAL_OFF
+    mode: `${CFG.dpBase}.mode`,                       // AUTO|MANUAL_ON|MANUAL_OFF
     target: `${CFG.dpBase}.target_c`,
     window: `${CFG.dpBase}.window_c`,
     price: `${CFG.dpBase}.price_eur_kwh`,
-    lastReason: `${CFG.dpBase}.reason`,
-    lastReqTs: `${CFG.dpBase}.last_req_ts`,
-    reqHeaterOn: `${CFG.dpBase}.req_heater_on`,
     temp: `${CFG.dpBase}.temp_c`,
     hum: `${CFG.dpBase}.hum_pct`,
-    power: `${CFG.dpBase}.power_w`
+    power: `${CFG.dpBase}.power_w`,
+    reqHeaterOn: `${CFG.dpBase}.req_heater_on`,      // Wunsch vom ESP
+    lastReason: `${CFG.dpBase}.reason`,
+    lastEvalTs: `${CFG.dpBase}.last_eval_ts`,
+    lastTempTs: `${CFG.dpBase}.last_temp_ts`,
+    lastReqTs: `${CFG.dpBase}.last_req_ts`,
+    lastCfgTs: `${CFG.dpBase}.last_cfg_ts`,
+    lastCmdTs: `${CFG.dpBase}.last_cmd_ts`,
+    lastAckTs: `${CFG.dpBase}.last_ack_ts`,
+    sessionKwh: `${CFG.dpBase}.kwh`,
+    sessionCost: `${CFG.dpBase}.cost_eur`,
+    sessionStartTs: `${CFG.dpBase}.start_ts`
 };
 
 (function initStates() {
-    ensureState(DP.sessionKwh,   { type: 'number', role: 'value.energy', unit: 'kWh', def: 0 });
-    ensureState(DP.sessionCost,  { type: 'number', role: 'value.currency', unit: 'EUR', def: 0 });
-    ensureState(DP.sessionStartTs, { type: 'number', role: 'value.time', unit: 'ms', def: nowMs() });
     ensureState(DP.mode,         { type: 'string', role: 'text', def: 'AUTO' });
     ensureState(DP.target,       { type: 'number', role: 'value.temperature', unit: '°C', def: 21.0 });
     ensureState(DP.window,       { type: 'number', role: 'value.temperature', unit: '°C', def: 1.0 });
     ensureState(DP.price,        { type: 'number', role: 'value', unit: 'EUR/kWh', def: 0.393 });
-    ensureState(DP.lastReason,   { type: 'string', role: 'text', def: 'init' });
-    ensureState(DP.lastReqTs,    { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
-    ensureState(DP.reqHeaterOn,  { type: 'boolean', role: 'switch', def: false });
     ensureState(DP.temp,         { type: 'number', role: 'value.temperature', unit: '°C', def: 0 });
     ensureState(DP.hum,          { type: 'number', role: 'value.humidity', unit: '%', def: 0 });
     ensureState(DP.power,        { type: 'number', role: 'value.power', unit: 'W', def: 0 });
+    ensureState(DP.reqHeaterOn,  { type: 'boolean', role: 'switch', def: false });
+    ensureState(DP.lastReason,   { type: 'string', role: 'text', def: 'init' });
+    ensureState(DP.lastEvalTs,   { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
+    ensureState(DP.lastTempTs,   { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
+    ensureState(DP.lastReqTs,    { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
+    ensureState(DP.lastCfgTs,    { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
+    ensureState(DP.lastCmdTs,    { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
+    ensureState(DP.lastAckTs,    { type: 'number', role: 'value.time', unit: 'ms', def: 0 });
+    ensureState(DP.sessionKwh,   { type: 'number', role: 'value.energy', unit: 'kWh', def: 0 });
+    ensureState(DP.sessionCost,  { type: 'number', role: 'value.currency', unit: 'EUR', def: 0 });
+    ensureState(DP.sessionStartTs, { type: 'number', role: 'value.time', unit: 'ms', def: nowMs() });
 })();
 
-/* ========= KONFIG AUS MQTT ========= */
+/* ========= MQTT INPUT ========= */
 function applyConfigFromMqtt(cfgObj) {
     if (!cfgObj || typeof cfgObj !== 'object') return;
-
-    if (typeof cfgObj.target_c === 'number') set(DP.target, cfgObj.target_c, true);
-    if (typeof cfgObj.window_c === 'number') set(DP.window, cfgObj.window_c, true);
-    if (typeof cfgObj.price_eur_kwh === 'number') set(DP.price, cfgObj.price_eur_kwh, true);
-
-    if (typeof cfgObj.mode === 'string') {
-        const m = cfgObj.mode.toUpperCase();
-        if (['AUTO', 'ON', 'OFF', 'MANUAL_ON', 'MANUAL_OFF'].includes(m)) {
-            set(DP.mode, (m === 'ON' ? 'MANUAL_ON' : (m === 'OFF' ? 'MANUAL_OFF' : m)), true);
-        }
-    }
+    if (typeof cfgObj.target_c === 'number') setAck(DP.target, cfgObj.target_c);
+    if (typeof cfgObj.window_c === 'number') setAck(DP.window, cfgObj.window_c);
+    if (typeof cfgObj.price_eur_kwh === 'number') setAck(DP.price, cfgObj.price_eur_kwh);
+    if (typeof cfgObj.mode === 'string') setAck(DP.mode, normalizeMode(cfgObj.mode));
+    setAck(DP.lastCfgTs, nowMs());
 }
 
-/* ========= REQUEST AUS MQTT ========= */
 function applyRequestFromMqtt(reqObj) {
     if (!reqObj || typeof reqObj !== 'object') return;
-
-    if (typeof reqObj.heater_request_on === 'boolean') set(DP.reqHeaterOn, reqObj.heater_request_on, true);
-    if (typeof reqObj.reason === 'string') set(DP.lastReason, reqObj.reason, true);
-    if (typeof reqObj.temp_c === 'number') set(DP.temp, reqObj.temp_c, true);
-
-    set(DP.lastReqTs, nowMs(), true);
+    if (typeof reqObj.heater_request_on === 'boolean') setAck(DP.reqHeaterOn, reqObj.heater_request_on);
+    if (typeof reqObj.reason === 'string') setAck(DP.lastReason, reqObj.reason);
+    if (typeof reqObj.temp_c === 'number') {
+        setAck(DP.temp, reqObj.temp_c);
+        setAck(DP.lastTempTs, nowMs());
+    }
+    if (typeof reqObj.target_c === 'number') setAck(DP.target, reqObj.target_c);
+    if (typeof reqObj.window_c === 'number') setAck(DP.window, reqObj.window_c);
+    if (typeof reqObj.mode === 'string') setAck(DP.mode, normalizeMode(reqObj.mode));
+    setAck(DP.lastReqTs, nowMs());
 }
 
-/* ========= STATE-INPUT AUS MQTT ========= */
 function applyStateFromMqtt(stateObj) {
     if (!stateObj || typeof stateObj !== 'object') return;
 
-    // Neues Modell: telemetry/config/status
     if (stateObj.telemetry) {
         const t = stateObj.telemetry;
-        if (typeof t.temp_c === 'number') set(DP.temp, t.temp_c, true);
-        if (typeof t.hum_pct === 'number') set(DP.hum, t.hum_pct, true);
-        if (typeof t.power_w === 'number') set(DP.power, t.power_w, true);
+        if (typeof t.temp_c === 'number') setAck(DP.temp, t.temp_c);
+        if (typeof t.hum_pct === 'number') setAck(DP.hum, t.hum_pct);
+        if (typeof t.power_w === 'number') setAck(DP.power, t.power_w);
+        setAck(DP.lastTempTs, nowMs());
     } else {
-        // Backward compatibility
-        if (typeof stateObj.temp_c === 'number') set(DP.temp, stateObj.temp_c, true);
-        if (typeof stateObj.hum_pct === 'number') set(DP.hum, stateObj.hum_pct, true);
-        if (typeof stateObj.power_w === 'number') set(DP.power, stateObj.power_w, true);
+        if (typeof stateObj.temp_c === 'number') setAck(DP.temp, stateObj.temp_c);
+        if (typeof stateObj.hum_pct === 'number') setAck(DP.hum, stateObj.hum_pct);
+        if (typeof stateObj.power_w === 'number') setAck(DP.power, stateObj.power_w);
+        if (typeof stateObj.temp_c === 'number' || typeof stateObj.hum_pct === 'number') {
+            setAck(DP.lastTempTs, nowMs());
+        }
     }
 }
 
 /* ========= ENERGIE/KOSTEN ========= */
 let lastEnergyTs = nowMs();
+let lastPublishedStatusPayload = '';
+let lastPublishedRealOn = null;
 function integrateEnergy() {
     const ts = nowMs();
     let dtH = (ts - lastEnergyTs) / 3600000;
     if (dtH < 0 || dtH > 1) dtH = 0;
     lastEnergyTs = ts;
 
-    let pW = Number(g(DP.power, 0));
-    if (!isFinite(pW) || pW < 0 || pW > CFG.maxPowerW) pW = 0;
+    let pW = toNum(g(DP.power, 0), 0);
+    if (pW < 0 || pW > CFG.maxPowerW) pW = 0;
 
-    const kwhAdd = (pW / 1000) * dtH;
-    const kwh = Number(g(DP.sessionKwh, 0)) + kwhAdd;
-    const price = Number(g(DP.price, 0.393));
-    const cost = kwh * price;
+    const addKwh = (pW / 1000) * dtH;
+    const kwh = Math.max(0, toNum(g(DP.sessionKwh, 0), 0) + addKwh);
+    const price = Math.max(0, toNum(g(DP.price, 0.393), 0.393));
+    const cost = Math.max(0, kwh * price);
 
-    set(DP.sessionKwh, Math.max(0, kwh), true);
-    set(DP.sessionCost, Math.max(0, cost), true);
+    setAck(DP.sessionKwh, kwh);
+    setAck(DP.sessionCost, cost);
 }
 
-/* ========= SCHALTLOGIK ========= */
-function resolveFinalState() {
-    // mode aus ESP-Config
-    const mode = String(g(DP.mode, 'AUTO')).toUpperCase();
-    const req = !!g(DP.reqHeaterOn, false);
+/* ========= ZENTRALE ENTSCHEIDUNG ========= */
+function getCurrentSwitchState() {
+    try {
+        const st = getState(CFG.zigbeeSwitchId);
+        if (!st) return false;
+        const b = toBool(st.val);
+        return b === null ? false : b;
+    } catch (e) {
+        log(`[Heizer Orchestrator] getState Fehler auf ${CFG.zigbeeSwitchId}: ${e}`, 'warn');
+        return false;
+    }
+}
 
-    let finalOn = false;
-    let reason = String(g(DP.lastReason, 'auto_request'));
+function resolveFinalDecision() {
+    const mode = normalizeMode(g(DP.mode, 'AUTO'));
+    const req = !!g(DP.reqHeaterOn, false);
+    const cur = getCurrentSwitchState();
+    const temp = toNum(g(DP.temp, NaN), NaN);
+    const target = toNum(g(DP.target, 21.0), 21.0);
+    const win = Math.max(0.2, toNum(g(DP.window, 1.0), 1.0));
+    const lastTempTs = toNum(g(DP.lastTempTs, 0), 0);
+    const stale = nowMs() - lastTempTs > CFG.staleMs;
+    const onTh = target - (win * 0.5);
+    const offTh = target + (win * 0.5);
+
+    let desired = cur;
+    let reason = 'hold';
 
     if (mode === 'MANUAL_ON') {
-        finalOn = true;
+        desired = true;
         reason = 'manual_on';
     } else if (mode === 'MANUAL_OFF') {
-        finalOn = false;
+        desired = false;
         reason = 'manual_off';
     } else {
-        // AUTO: ioBroker folgt request vom ESP (ESP hat Sensor/Hysterese/UI)
-        finalOn = req;
-        if (!reason || reason === 'init') reason = 'auto_request';
+        // AUTO zentral in ioBroker:
+        // bei fehlender/alter Temp: auf sicheren AUS gehen
+        if (!Number.isFinite(temp)) {
+            desired = false;
+            reason = 'sensor_invalid';
+        } else if (stale) {
+            desired = false;
+            reason = 'sensor_stale';
+        } else if (temp <= onTh) {
+            desired = true;
+            reason = 'below_on_threshold';
+        } else if (temp >= offTh) {
+            desired = false;
+            reason = 'above_off_threshold';
+        } else {
+            // Hysterese halten
+            desired = cur;
+            reason = cur ? 'in_hysteresis_keep_on' : 'in_hysteresis_keep_off';
+        }
+
+        // request nur als Zusatzinfo im AUTO
+        if (reason.startsWith('in_hysteresis') && req !== cur) {
+            reason = req ? 'request_on_hysteresis' : 'request_off_hysteresis';
+        }
     }
 
-    return { finalOn, modeState: mode, reason };
+    return { desired, modeState: mode, reason };
 }
 
-function publishStatus(finalOn, modeState, reason) {
-    const powerW = Number(g(DP.power, 0));
-    const sessKwh = Number(g(DP.sessionKwh, 0));
-    const sessCost = Number(g(DP.sessionCost, 0));
+function publishStatusFromReal(modeState, reason, realOn) {
+    const powerW = toNum(g(DP.power, 0), 0);
+    const sessKwh = toNum(g(DP.sessionKwh, 0), 0);
+    const sessCost = toNum(g(DP.sessionCost, 0), 0);
 
     const payload = JSON.stringify({
-        heater_state: !!finalOn,
+        heater_state: !!realOn,
         mode_state: modeState,
         reason: reason,
-        power_w: isFinite(powerW) ? powerW : 0,
-        session_kwh: isFinite(sessKwh) ? sessKwh : 0,
-        session_cost_eur: isFinite(sessCost) ? sessCost : 0,
+        power_w: powerW,
+        session_kwh: sessKwh,
+        session_cost_eur: sessCost,
         ts_ms: nowMs()
     });
 
-    set(CFG.mqttStatusOut, payload, true);
+    // Schutz: nur senden, wenn sich Inhalt geaendert hat.
+    if (payload === lastPublishedStatusPayload) {
+        return;
+    }
+
+    // MQTT status raus: ack=false, damit mqtt.0 publish ausloest.
+    if (safeSetForeign(CFG.mqttStatusOut, payload, false)) {
+        lastPublishedStatusPayload = payload;
+        lastPublishedRealOn = !!realOn;
+        setAck(DP.lastAckTs, nowMs());
+    }
 }
 
-/* ========= AUSFÜHRUNG ========= */
+function commandAndConfirm(desired, modeState, reason) {
+    const cur = getCurrentSwitchState();
+    if (cur !== desired) {
+        setState(CFG.zigbeeSwitchId, !!desired, false);
+        setAck(DP.lastCmdTs, nowMs());
+    }
+    setTimeout(() => {
+        const realOn = getCurrentSwitchState();
+        const finalReason = (realOn === desired) ? reason : 'override_or_failed';
+        setAck(DP.lastReason, finalReason);
+        publishStatusFromReal(modeState, finalReason, realOn);
+    }, CFG.confirmDelayMs);
+}
+
 function evaluateAndAct() {
     integrateEnergy();
 
-    // fallback temp/hum wenn kein MQTT-State kommt
+    // Fallback temp/hum wenn kein ESP-Update anliegt
     if (CFG.tempIdFallback) {
         const t = getState(CFG.tempIdFallback);
-        if (t && typeof t.val === 'number') set(DP.temp, t.val, true);
+        if (t && typeof t.val === 'number') {
+            setAck(DP.temp, t.val);
+            setAck(DP.lastTempTs, nowMs());
+        }
     }
     if (CFG.humIdFallback) {
         const h = getState(CFG.humIdFallback);
-        if (h && typeof h.val === 'number') set(DP.hum, h.val, true);
+        if (h && typeof h.val === 'number') setAck(DP.hum, h.val);
     }
 
-    const { finalOn, modeState, reason } = resolveFinalState();
-
-    // ECHTES Schalten
-    setState(CFG.zigbeeSwitchId, !!finalOn, false);
-
-    // Feedback an ESP
-    publishStatus(finalOn, modeState, reason);
+    const d = resolveFinalDecision();
+    setAck(DP.lastReason, d.reason);
+    setAck(DP.lastEvalTs, nowMs());
+    commandAndConfirm(d.desired, d.modeState, d.reason);
 }
 
 /* ========= SUBSCRIPTIONS ========= */
@@ -251,13 +345,24 @@ on({ id: CFG.mqttStateIn, change: 'any' }, (obj) => {
 
 on({ id: CFG.zigbeePowerId, change: 'any' }, (obj) => {
     const n = Number(obj.state.val);
-    if (isFinite(n)) set(DP.power, n, true);
+    if (Number.isFinite(n)) setAck(DP.power, n);
+});
+
+// Bei echtem Zigbee-State-Change immer bestaetigten Status rausgeben.
+on({ id: CFG.zigbeeSwitchId, change: 'any' }, () => {
+    const modeState = normalizeMode(g(DP.mode, 'AUTO'));
+    const reason = String(g(DP.lastReason, 'zigbee_feedback'));
+    const realOn = getCurrentSwitchState();
+    if (lastPublishedRealOn !== null && realOn === lastPublishedRealOn) {
+        return;
+    }
+    publishStatusFromReal(modeState, reason, realOn);
 });
 
 /* ========= TIMER ========= */
 schedule(`*/${CFG.evalIntervalSec} * * * * *`, () => evaluateAndAct());
 
 /* ========= START ========= */
-set(DP.sessionStartTs, nowMs(), true);
+setAck(DP.sessionStartTs, nowMs());
 evaluateAndAct();
-log('[Heizer Orchestrator] gestartet', 'info');
+log('[Heizer Orchestrator] gestartet (AUTO zentral in ioBroker)', 'info');

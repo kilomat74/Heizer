@@ -170,6 +170,8 @@ static bool s_switch_topic_last_valid = false;
 static bool s_switch_topic_last_state = false;
 static bool s_request_topic_last_valid = false;
 static bool s_request_topic_last_state = false;
+static heat_mode_t s_request_topic_last_mode = HEAT_MODE_AUTO;
+static bool s_request_topic_last_automation_remote = true;
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 
 static bool parse_power_payload(const char *payload, int len, float *out_watts);
@@ -814,9 +816,12 @@ static void update_control_locked(app_state_t *st)
     }
 }
 
-static void mqtt_publish_state(void)
+static void mqtt_publish_state(bool force_control_publish)
 {
     if (!s_mqtt_client) {
+        if (force_control_publish) {
+            ESP_LOGW(TAG, "MQTT control publish requested but client is NULL");
+        }
         return;
     }
 
@@ -910,20 +915,34 @@ static void mqtt_publish_state(void)
     }
 
     if (topic_request[0] != '\0') {
-        if (!s_request_topic_last_valid || s_request_topic_last_state != st.heater_request_on) {
+        bool req_changed = !s_request_topic_last_valid ||
+                           s_request_topic_last_state != st.heater_request_on ||
+                           s_request_topic_last_mode != st.effective_mode ||
+                           s_request_topic_last_automation_remote != st.automation_remote;
+        if (force_control_publish || req_changed) {
             cJSON *req = cJSON_CreateObject();
             cJSON_AddBoolToObject(req, "heater_request_on", st.heater_request_on);
             cJSON_AddStringToObject(req, "mode", mode_to_string(st.effective_mode));
             cJSON_AddStringToObject(req, "reason", st.heat_reason);
+            cJSON_AddBoolToObject(req, "automation_remote", st.automation_remote);
+            cJSON_AddBoolToObject(req, "remote_enable", st.automation_remote);
             cJSON_AddNumberToObject(req, "temp_c", st.temp_c);
             cJSON_AddNumberToObject(req, "target_c", st.target_c);
             cJSON_AddNumberToObject(req, "window_c", st.window_c);
+            cJSON_AddNumberToObject(req, "ts_ms", (double)now_ms);
             char *req_json = cJSON_PrintUnformatted(req);
             if (req_json) {
-                esp_mqtt_client_publish(s_mqtt_client, topic_request, req_json, 0, 1, 1);
+                int req_msg_id = esp_mqtt_client_publish(s_mqtt_client, topic_request, req_json, 0, 1, 1);
+                ESP_LOGI(TAG,
+                         "MQTT control publish topic=%s msg_id=%d force=%d req=%d mode=%s remote=%d reason=%s",
+                         topic_request, req_msg_id, force_control_publish ? 1 : 0,
+                         st.heater_request_on ? 1 : 0, mode_to_string(st.effective_mode),
+                         st.automation_remote ? 1 : 0, st.heat_reason);
                 cJSON_free(req_json);
                 s_request_topic_last_valid = true;
                 s_request_topic_last_state = st.heater_request_on;
+                s_request_topic_last_mode = st.effective_mode;
+                s_request_topic_last_automation_remote = st.automation_remote;
             }
             cJSON_Delete(req);
         }
@@ -961,6 +980,8 @@ static void mqtt_restart(void)
     }
     s_switch_topic_last_valid = false;
     s_request_topic_last_valid = false;
+    s_request_topic_last_mode = HEAT_MODE_AUTO;
+    s_request_topic_last_automation_remote = true;
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = broker_uri,
@@ -992,7 +1013,7 @@ static void control_task(void *arg)
         xSemaphoreGive(s_state_mutex);
 
         display_update();
-        mqtt_publish_state();
+        mqtt_publish_state(false);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
@@ -1304,6 +1325,11 @@ static esp_err_t http_api_config_post(httpd_req_t *req)
         s_state.price_eur_kwh = p;
     }
     update_control_locked(&s_state);
+    ESP_LOGI(TAG,
+             "WebUI save applied: mode=%s auto_remote=%d fallback=%d target=%.2f window=%.2f request=%d reason=%s",
+             mode_to_string(s_state.mode), s_state.automation_remote ? 1 : 0,
+             s_state.local_fallback_enabled ? 1 : 0, s_state.target_c, s_state.window_c,
+             s_state.heater_request_on ? 1 : 0, s_state.heat_reason);
     xSemaphoreGive(s_state_mutex);
     app_cfg_save();
 
@@ -1311,7 +1337,7 @@ static esp_err_t http_api_config_post(httpd_req_t *req)
     if (mqtt_changed) {
         mqtt_restart();
     }
-    mqtt_publish_state();
+    mqtt_publish_state(true);
     return httpd_resp_sendstr(req, "ok");
 }
 
@@ -1375,7 +1401,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         esp_mqtt_client_subscribe(s_mqtt_client, topic_power, 1);
         esp_mqtt_client_subscribe(s_mqtt_client, topic_timer, 1);
         esp_mqtt_client_subscribe(s_mqtt_client, topic_status, 1);
-        mqtt_publish_state();
+        ESP_LOGI(TAG, "MQTT initial force publish (state/config/request)");
+        mqtt_publish_state(true);
     } else if (event_id == MQTT_EVENT_DISCONNECTED) {
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         s_state.mqtt_connected = false;
@@ -1424,7 +1451,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             xSemaphoreGive(s_state_mutex);
             app_cfg_save();
             free(data);
-            mqtt_publish_state();
+            mqtt_publish_state(true);
         } else if (strcmp(topic, topic_power) == 0) {
             float p = 0.0f;
             if (parse_power_payload(event->data, event->data_len, &p) && p >= 0.0f && p < 50000.0f) {
@@ -1471,7 +1498,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 xSemaphoreGive(s_state_mutex);
                 cJSON_Delete(root);
                 ESP_LOGI(TAG, "MQTT timer config applied");
-                mqtt_publish_state();
+                mqtt_publish_state(true);
             }
             free(data);
         } else if (strcmp(topic, topic_status) == 0) {
@@ -1554,7 +1581,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             free(data);
 
             if (update_publish) {
-                mqtt_publish_state();
+                mqtt_publish_state(false);
             }
         }
     }
